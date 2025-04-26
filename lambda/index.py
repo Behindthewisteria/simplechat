@@ -1,8 +1,8 @@
 # lambda/index.py
 import json
 import os
-import boto3
-import re  # 正規表現モジュールをインポート
+import re
+import urllib.request  # 標準ライブラリの urllib.request を使用
 from botocore.exceptions import ClientError
 
 
@@ -14,20 +14,33 @@ def extract_region_from_arn(arn):
         return match.group(1)
     return "us-east-1"  # デフォルト値
 
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
-
-# モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+# 外部APIを呼び出す関数
+def call_external_api(api_url, data=None, headers=None):
+    try:
+        # リクエストの準備
+        if data:
+            data = json.dumps(data).encode('utf-8')
+        
+        # リクエストオブジェクトの作成
+        request = urllib.request.Request(
+            url=api_url,
+            data=data,
+            headers=headers or {"Content-Type": "application/json"}
+        )
+        
+        # APIの呼び出し
+        with urllib.request.urlopen(request) as response:
+            response_data = response.read().decode('utf-8')
+            return json.loads(response_data)
+    except Exception as e:
+        print(f"外部API呼び出しエラー: {str(e)}")
+        return {"error": str(e)}
 
 def lambda_handler(event, context):
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
+        # リージョン情報を取得（設定のため保持）
+        region = extract_region_from_arn(context.invoked_function_arn)
+        print(f"Lambda executing in region: {region}")
         
         print("Received event:", json.dumps(event))
         
@@ -42,63 +55,52 @@ def lambda_handler(event, context):
         message = body['message']
         conversation_history = body.get('conversationHistory', [])
         
-        print("Processing message:", message)
-        print("Using model:", MODEL_ID)
+        # 外部APIの設定を取得
+        api_url = body.get('https://3c49-35-185-90-217.ngrok-free.app/')
+        api_data = body.get('apiData', {})
+        api_headers = body.get('apiHeaders', {})
         
-        # 会話履歴を使用
-        messages = conversation_history.copy()
+        if not api_url:
+            raise Exception("API URL is required")
+            
+        print(f"Calling external API: {api_url}")
         
         # ユーザーメッセージを追加
+        messages = conversation_history.copy()
         messages.append({
             "role": "user",
             "content": message
         })
         
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
+        # 外部APIに渡すデータを準備
+        if api_data is None:
+            api_data = {}
         
-        # invoke_model用のリクエストペイロード
-        request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
-        }
+        # 会話履歴とメッセージをAPIデータに追加
+        api_data.update({
+            "messages": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
+            "user_info": user_info
+        })
         
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
+        # 外部APIを呼び出し
+        api_response = call_external_api(api_url, api_data, api_headers)
         
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
-        )
+        # APIレスポンスからアシスタント応答を抽出
+        if "error" in api_response:
+            raise Exception(f"External API error: {api_response['error']}")
         
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
-        
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
+        # APIレスポンスの形式に応じて処理
+        assistant_response = ""
+        if isinstance(api_response, dict):
+            # レスポンスが辞書形式の場合
+            assistant_response = api_response.get("response", 
+                               api_response.get("message", 
+                               api_response.get("content", 
+                               api_response.get("text", 
+                               str(api_response)))))
+        else:
+            # 文字列またはその他の形式の場合
+            assistant_response = str(api_response)
         
         # アシスタントの応答を会話履歴に追加
         messages.append({
